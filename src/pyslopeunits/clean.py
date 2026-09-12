@@ -365,6 +365,8 @@ def clean_slope_units(
     tile_rows: int = 1536,
     tile_cols: int = 1536,
     reclump: bool = True,
+    memory_budget_bytes: int | None = None,
+    scratch_ram_fraction: float = 0.50,
     verbose: bool = True,
 ) -> CleanResult:
     """Clean a PySlope categorical raster.
@@ -389,7 +391,12 @@ def clean_slope_units(
     output_raster = Path(output_raster)
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
-    store = MemmapStore(work_dir / "clean_memmap")
+    store = MemmapStore(
+        work_dir / "clean_memmap",
+        ram_budget_bytes=memory_budget_bytes,
+        ram_fraction=scratch_ram_fraction,
+        verbose=verbose,
+    )
 
     method = method.lower()
     if method not in ("grass_basic", "grass_quick"):
@@ -434,17 +441,17 @@ def clean_slope_units(
                 f"small-cells={removed_small_cells:,}"
             )
 
-        seed = store.create(
+        seed = store.create_temp(
             "clean_seed", meta.shape, np.int32, fill=0
         )
         _make_seed_from_kept_labels(src, keep, seed)
 
-        basic = store.create(
+        basic = store.create_temp(
             "clean_basic", meta.shape, np.int32, fill=0
         )
 
         # valid target is the original positive slope-unit domain.
-        valid = store.create(
+        valid = store.create_temp(
             "clean_valid", meta.shape, np.uint8, fill=0
         )
         rows, cols = meta.shape
@@ -474,7 +481,7 @@ def clean_slope_units(
     unfilled_quick = unfilled_basic
 
     if method == "grass_quick":
-        stripe_seed = store.create(
+        stripe_seed = store.create_temp(
             "clean_stripe_seed", current.shape, np.int32, fill=0
         )
         _quick_interior_seed(
@@ -485,7 +492,7 @@ def clean_slope_units(
             verbose=verbose,
         )
 
-        quick = store.create(
+        quick = store.create_temp(
             "clean_quick", current.shape, np.int32, fill=0
         )
         unfilled_quick = _adaptive_fill_all(
@@ -586,6 +593,7 @@ def clean_slope_units(
         encoding="utf-8",
     )
 
+    store.write_memory_report("memory_allocation_clean.json")
     if verbose:
         print(
             f"[PySlopeUnits clean] complete | final-units={final_units:,} | "

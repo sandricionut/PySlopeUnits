@@ -2,13 +2,15 @@
 
 **A hierarchical graph-based algorithm for scalable slope-unit delineation from massive digital elevation models**
 
-PySlopeUnits is an open-source Python implementation for large-scale delineation of geomorphological slope units from digital elevation models (DEMs). The current pipeline uses reusable memory-mapped hydrological caches, multi-level half-basin candidates, a hierarchical candidate DAG, graph-based selection, residual assignment, and final 4-neighbour connected-component consolidation.
+PySlopeUnits is an open-source Python implementation for delineating geomorphological slope units from digital elevation models (DEMs), from local high-resolution surveys to very large regional or continental mosaics.
+
+The default execution path combines exact global out-of-core hydrology, multi-level stream-derived half-basin candidates, a bounded-memory lazy hierarchical graph cut, final gap assignment, and 4-neighbour connected-component consolidation. Persistent/shared arrays are memory mapped; local scratch is RAM-first and spills to disk when required.
 
 Research software associated with a manuscript in preparation for *Environmental Modelling & Software*.
 
 ## Platforms
 
-PySlopeUnits is packaged for Linux, Windows and macOS and is continuously import-tested on all three platforms through GitHub Actions.
+Linux, Windows and macOS. Multiprocessing uses cross-platform `spawn` semantics and shared file-backed arrays.
 
 ## Installation
 
@@ -16,69 +18,114 @@ PySlopeUnits is packaged for Linux, Windows and macOS and is continuously import
 python -m pip install -e .
 ```
 
+## Command line
+
+The same command is used for any dataset size:
+
+```bash
+pyslopeunits dem.tif output_dir
+```
+
+A projected DEM in metres keeps its native CRS and square pixel size by default. Reprojection/resampling is explicit:
+
+```bash
+pyslopeunits dem.tif output_dir \
+  --target-crs EPSG:3035 \
+  --fine-resolution-m 30
+```
+
+Useful resource controls:
+
+```bash
+pyslopeunits dem.tif output_dir \
+  --memory-limit-gb 16 \
+  --workers 8 \
+  --numba-threads 8
+```
+
+`--hierarchy-mode lazy` is the scalable default. `--hierarchy-mode materialized` builds the complete reusable DAG and is retained primarily for regression tests and experiments.
+
+Candidate rasters are also adaptive: `--candidate-cache-mode auto` keeps all threshold rasters when disk capacity is comfortable and switches to one-level-at-a-time streaming for massive grids. Use `all` when repeated parameter experiments need maximum reuse, or `stream` to minimize temporary disk.
+
 ## Python API
 
 ```python
-from pyslopeunits import SlopeUnits
+from pyslopeunits import AdaptiveSlopeUnits
 
-model = SlopeUnits(
+model = AdaptiveSlopeUnits(
+    memory_limit_gb=16,
     threshold_m2=250_000,
     min_area_m2=100_000,
     cv_min=0.25,
-    workers=8,
-    numba_threads=8,
 )
 
-result = model.run(
-    "dem.tif",
-    "slope_units.tif",
-    work_dir="work",
-)
+result = model.run("dem.tif", "run")
 ```
 
-## Command line
-
-```bash
-pyslopeunits dem.tif slope_units.tif --work-dir work --workers 8
-```
-
-GeoPackage export uses only open-source Fiona + Rasterio.
+For lower-level control over an already prepared projected DEM, `pyslopeunits.SlopeUnits` remains available.
 
 ## Workflow
 
 ```text
-DEM
+DEM / VRT / mosaic
  │
  ▼
-A*-based terrain routing + MFD accumulation
+Adaptive grid + machine resource planning
  │
  ▼
-Reusable memory-mapped hydrological cache
+Exact A*-based routing + MFD accumulation
+(out-of-core; 32- or 64-bit cell indices selected automatically)
  │
  ▼
-Multi-level half-basin candidates
+Multi-level stream-derived half-basin candidates
  │
  ▼
-Hierarchical candidate DAG
+Lazy hierarchical graph evaluation
+(active frontier only; disk-bucketed child statistics)
  │
  ▼
-Graph-based selection + residual assignment
+Last-half-basin gap fill
  │
  ▼
-4-neighbour connected components
+4-neighbour connected-component clump + optional cleaning
  │
  ▼
-GeoTIFF + optional GeoPackage
+GeoTIFF + optional GeoPackage/diagnostics
 ```
 
-## Examples
+## Large datasets
+
+PySlopeUnits automatically detects CPU, RAM and free disk space and constructs a hydrological resource plan. Coarse hydrological domains are planning units only and never define final slope-unit boundaries. Scientific calculations use the canonical fine DEM and exact global hydrology, so changing the memory limit does not change slope-unit boundaries.
+
+For very large grids, flat cell indices automatically switch from 32-bit to 64-bit. The lazy hierarchy avoids materializing descendants of graph nodes that have already been finalized or rejected, eliminating the previous O(total DAG nodes) Python-memory bottleneck.
+
+Planning only:
 
 ```bash
-python examples/run_10m_20m.py dem_20m.tif dem_10m.tif
-python examples/benchmark_cache_modes.py dem_20m.tif
+pyslopeunits europe.vrt europe_run \
+  --fine-resolution-m 30 \
+  --target-crs EPSG:3035 \
+  --plan-only
 ```
 
-Large runtime caches, DEMs and generated geospatial outputs are excluded from version control.
+Full execution:
+
+```bash
+pyslopeunits europe.vrt europe_run \
+  --fine-resolution-m 30 \
+  --target-crs EPSG:3035 \
+  --memory-limit-gb 32
+```
+
+Practical limits are available temporary-disk capacity and runtime, not physical RAM alone.
+
+## NoData
+
+Raster metadata NoData is always respected. Additional sentinel values can be supplied without hard-coding them in the engine:
+
+```bash
+pyslopeunits dem.tif output_dir --nodata -32767 32767
+```
 
 ## Citation
 

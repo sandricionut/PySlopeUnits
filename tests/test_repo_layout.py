@@ -10,6 +10,10 @@ def test_core_files_present():
         root / "src/pyslopeunits/mfd_parallel.py",
         root / "src/pyslopeunits/memmap_store.py",
         root / "examples/run_10m_20m.py",
+        root / "src/pyslopeunits/resources.py",
+        root / "src/pyslopeunits/hydro_domains.py",
+        root / "src/pyslopeunits/adaptive.py",
+        root / "src/pyslopeunits/lazy_graph.py",
     ]
     missing = [str(path.relative_to(root)) for path in required if not path.exists()]
     assert not missing, f"Missing PySlopeUnits core files: {missing}"

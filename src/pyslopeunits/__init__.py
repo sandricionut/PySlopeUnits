@@ -9,6 +9,8 @@ from .vector_export import export_geopackage, VectorExportResult
 from .clean import clean_slope_units, CleanResult
 from .diagnostics import write_boundary_raster, write_hashed_display_raster
 from .dag import CandidateDAG, DAGBuildResult
+from .adaptive import AdaptiveSlopeUnits, AdaptiveRunResult
+from .resources import SystemResources, ResourcePlan, detect_system_resources, make_resource_plan
 
 __all__ = [
     "__version__",
@@ -28,4 +30,10 @@ __all__ = [
     "write_hashed_display_raster",
     "CandidateDAG",
     "DAGBuildResult",
+    "AdaptiveSlopeUnits",
+    "AdaptiveRunResult",
+    "SystemResources",
+    "ResourcePlan",
+    "detect_system_resources",
+    "make_resource_plan",
 ]

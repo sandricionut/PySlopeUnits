@@ -64,6 +64,9 @@ class CandidateHierarchyPrecomputer:
         numba_threads: int = 8,
         hydro_scale: int = 1000,
         mfd_block_cells: int = 1_000_000,
+        nodata_values=None,
+        memory_budget_bytes: int | None = None,
+        scratch_ram_fraction: float = 0.50,
         verbose: bool = True,
     ):
         self.threshold_m2 = float(threshold_m2)
@@ -74,6 +77,11 @@ class CandidateHierarchyPrecomputer:
         self.numba_threads = max(1, int(numba_threads))
         self.hydro_scale = int(hydro_scale)
         self.mfd_block_cells = max(10_000, int(mfd_block_cells))
+        self.nodata_values = None if nodata_values is None else tuple(float(x) for x in nodata_values)
+        self.memory_budget_bytes = (
+            None if memory_budget_bytes is None else max(0, int(memory_budget_bytes))
+        )
+        self.scratch_ram_fraction = float(scratch_ram_fraction)
         self.verbose = bool(verbose)
 
     def run(self, dem_path, work_dir) -> CandidatePreparationResult:
@@ -83,7 +91,12 @@ class CandidateHierarchyPrecomputer:
         work_dir.mkdir(parents=True, exist_ok=True)
 
         meta = read_meta(dem_path)
-        store = MemmapStore(work_dir / "memmap")
+        store = MemmapStore(
+            work_dir / "memmap",
+            ram_budget_bytes=self.memory_budget_bytes,
+            ram_fraction=self.scratch_ram_fraction,
+            verbose=self.verbose,
+        )
         cache = MultiThresholdCandidateCache(work_dir)
 
         # Reuse the same tested hydrology implementation.
@@ -102,6 +115,9 @@ class CandidateHierarchyPrecomputer:
             reuse_hydrology=True,
             reuse_candidates=True,
             keep_work=True,
+            nodata_values=self.nodata_values,
+            memory_budget_bytes=self.memory_budget_bytes,
+            scratch_ram_fraction=self.scratch_ram_fraction,
             verbose=self.verbose,
         )
         model._prepare_hydrology(dem_path, store, meta)
@@ -233,5 +249,6 @@ class CandidateHierarchyPrecomputer:
         (work_dir / "candidate_precompute_report.json").write_text(
             json.dumps(report, indent=2), encoding="utf-8"
         )
+        store.write_memory_report("memory_allocation_hydrology.json")
 
         return result

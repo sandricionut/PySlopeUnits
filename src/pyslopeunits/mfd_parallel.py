@@ -19,6 +19,7 @@ from .kernels import (
 )
 from .memmap_store import MemmapStore
 from .mfd_workers import compute_weight_slice_worker, adjusted_receiver_worker
+from .indexing import index_dtype_for_shape
 
 
 @dataclass(frozen=True)
@@ -146,9 +147,10 @@ def run_mfd_block_parallel(
     order = store.open("order", "r")
     nv = int(order.size)
 
-    rank = store.create("mfd_rank", dem.shape, np.int32)
+    index_dtype = index_dtype_for_shape(dem.shape)
+    rank = store.create("mfd_rank", dem.shape, index_dtype)
     accumulation = store.create("accumulation", dem.shape, np.float64, fill=0.0)
-    receiver = store.create("receiver", dem.shape, np.int32, fill=-1)
+    receiver = store.create("receiver", dem.shape, index_dtype, fill=-1)
 
     if verbose:
         print(f"[PySlopeUnits] MFD rank map | valid={nv:,}")

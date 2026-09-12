@@ -148,7 +148,7 @@ def render_and_clump(
     last_stats = candidate_cache.load_stats(last_key)
     max_hb = int(last_stats["max_half_basin_label"])
 
-    pre = store.create("v14_preclump", shape, np.int32, fill=0)
+    pre = store.create_temp("v14_preclump", shape, np.int32, fill=0)
     selected_max = int(node_category.max())
     hb_offset = selected_max + 1
     residual_category = hb_offset + max_hb + 1
@@ -186,6 +186,9 @@ def render_and_clump(
         print("[PySlopeUnits] GRASS-like 4-neighbour categorical clump")
 
     final, n_units = clump_equal_categories(pre, valid, store, verbose=verbose)
+    store.close_array(pre)
+    del pre
+    store.remove("v14_preclump", best_effort=True)
     pre_categories = int(residual_category)
     return final, int(n_units), pre_categories
 

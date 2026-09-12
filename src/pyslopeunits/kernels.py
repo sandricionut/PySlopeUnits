@@ -145,29 +145,42 @@ def _slope2(ele: float, up_ele: float, dist: float) -> float:
 
 
 @njit(cache=True)
-def astar_route(dem_scaled: np.ndarray, valid: np.ndarray,
-                xres_scaled: float, yres_scaled: float,
-                receiver: np.ndarray, order: np.ndarray, edgeflag: np.ndarray) -> int:
-    """Numba translation of the Stage-6 GRASS-like A* routing kernel.
-
-    Returns number of visited valid cells. Outputs are written in-place.
-    """
+def _astar_route_impl(
+    dem_scaled: np.ndarray,
+    valid: np.ndarray,
+    xres_scaled: float,
+    yres_scaled: float,
+    receiver: np.ndarray,
+    order: np.ndarray,
+    edgeflag: np.ndarray,
+    inlist: np.ndarray,
+    worked: np.ndarray,
+    heap_idx: np.ndarray,
+    heap_age: np.ndarray,
+) -> int:
+    """Shared A* implementation with caller-owned scratch arrays."""
     rows, cols = dem_scaled.shape
     n = dem_scaled.size
     zf = dem_scaled.ravel()
     vf = valid.ravel()
     rec = receiver.ravel()
     ef = edgeflag.ravel()
+    il = inlist.ravel()
+    wk = worked.ravel()
 
-    inlist = np.zeros(n, dtype=np.uint8)
-    worked = np.zeros(n, dtype=np.uint8)
+    # Scratch arrays may be reused after an interrupted run.
+    for i in range(n):
+        il[i] = 0
+        wk[i] = 0
+
     nvalid = 0
     for i in range(n):
         if vf[i] != 0:
             nvalid += 1
 
-    heap_idx = np.empty(nvalid, dtype=np.int32)
-    heap_age = np.empty(nvalid, dtype=np.int32)
+    if heap_idx.size < nvalid or heap_age.size < nvalid:
+        return -1
+
     heap_size = 0
     age = 0
 
@@ -189,7 +202,7 @@ def astar_route(dem_scaled: np.ndarray, valid: np.ndarray,
                         seed = True
                         break
             if seed:
-                inlist[i] = 1
+                il[i] = 1
                 ef[i] = 1
                 heap_size = _heap_push(heap_idx, heap_age, heap_size, i, age, zf)
                 age += 1
@@ -205,7 +218,7 @@ def astar_route(dem_scaled: np.ndarray, valid: np.ndarray,
 
     slopes = np.empty(8, dtype=np.float64)
     nbr_e = np.empty(8, dtype=np.float64)
-    nbr_ids = np.empty(8, dtype=np.int32)
+    nbr_ids = np.empty(8, dtype=np.int64)
 
     k = 0
     while heap_size > 0:
@@ -228,7 +241,7 @@ def astar_route(dem_scaled: np.ndarray, valid: np.ndarray,
             if vf[j] == 0:
                 continue
             nbr_ids[ct] = j
-            if worked[j] == 0:
+            if wk[j] == 0:
                 nbr_e[ct] = float(zf[j])
                 slopes[ct] = _slope2(ele, nbr_e[ct], dist[ct])
 
@@ -236,7 +249,7 @@ def astar_route(dem_scaled: np.ndarray, valid: np.ndarray,
             j = nbr_ids[ct]
             if j < 0:
                 continue
-            eligible = inlist[j] == 0 or (worked[j] == 0 and ef[j] != 0)
+            eligible = il[j] == 0 or (wk[j] == 0 and ef[j] != 0)
             skip_diag = False
             if eligible and ct > 3 and slopes[ct] > 0.0:
                 ew = NBR_EW[ct]
@@ -250,17 +263,61 @@ def astar_route(dem_scaled: np.ndarray, valid: np.ndarray,
             if skip_diag:
                 continue
 
-            if inlist[j] == 0:
+            if il[j] == 0:
                 rec[j] = i
-                inlist[j] = 1
+                il[j] = 1
                 heap_size = _heap_push(heap_idx, heap_age, heap_size, j, age, zf)
                 age += 1
-            elif worked[j] == 0 and ef[j] != 0 and slopes[ct] > 0.0:
+            elif wk[j] == 0 and ef[j] != 0 and slopes[ct] > 0.0:
                 rec[j] = i
 
-        worked[i] = 1
+        wk[i] = 1
 
     return k
+
+
+@njit(cache=True)
+def astar_route(dem_scaled: np.ndarray, valid: np.ndarray,
+                xres_scaled: float, yres_scaled: float,
+                receiver: np.ndarray, order: np.ndarray, edgeflag: np.ndarray) -> int:
+    """Backward-compatible in-RAM scratch A* routing."""
+    n = dem_scaled.size
+    nvalid = order.size
+    inlist = np.zeros(n, dtype=np.uint8)
+    worked = np.zeros(n, dtype=np.uint8)
+    heap_idx = np.empty(nvalid, dtype=np.int64)
+    heap_age = np.empty(nvalid, dtype=np.int64)
+    return _astar_route_impl(
+        dem_scaled, valid, xres_scaled, yres_scaled,
+        receiver, order, edgeflag,
+        inlist, worked, heap_idx, heap_age,
+    )
+
+
+@njit(cache=True)
+def astar_route_preallocated(
+    dem_scaled: np.ndarray,
+    valid: np.ndarray,
+    xres_scaled: float,
+    yres_scaled: float,
+    receiver: np.ndarray,
+    order: np.ndarray,
+    edgeflag: np.ndarray,
+    inlist: np.ndarray,
+    worked: np.ndarray,
+    heap_idx: np.ndarray,
+    heap_age: np.ndarray,
+) -> int:
+    """A* routing with disk-backed/memmap scratch supplied by the caller.
+
+    Numerical and tie-breaking semantics are identical to :func:`astar_route`;
+    only ownership of the large scratch arrays changes.
+    """
+    return _astar_route_impl(
+        dem_scaled, valid, xres_scaled, yres_scaled,
+        receiver, order, edgeflag,
+        inlist, worked, heap_idx, heap_age,
+    )
 
 
 @njit(cache=True)
@@ -278,7 +335,7 @@ def mfd_accumulation(dem_scaled: np.ndarray, valid: np.ndarray,
     adj = adjusted_receiver.ravel()
     nv = order.size
 
-    rank = np.full(n, -1, dtype=np.int32)
+    rank = np.full(n, -1, dtype=np.int64)
     for pos in range(nv):
         rank[order[pos]] = pos
     for i in range(n):
@@ -298,7 +355,7 @@ def mfd_accumulation(dem_scaled: np.ndarray, valid: np.ndarray,
     for ct in range(4, 8):
         dist[ct] = diag
 
-    ids = np.empty(9, dtype=np.int32)
+    ids = np.empty(9, dtype=np.int64)
     weights = np.empty(9, dtype=np.float64)
 
     for pos in range(nv - 1, -1, -1):
@@ -822,7 +879,7 @@ def mark_branch_roots(receiver: np.ndarray, stream: np.ndarray, valid: np.ndarra
     mf = mark.ravel()
     for i in range(n):
         mf[i] = 0
-    donors = np.empty(8, dtype=np.int32)
+    donors = np.empty(8, dtype=np.int64)
     for i in range(n):
         if vf[i] == 0 or sf[i] == 0:
             continue
@@ -892,8 +949,8 @@ def process_stream_outlets(outlets: np.ndarray, roots: np.ndarray,
     af = accumulation.ravel()
     vf = valid.ravel()
     haf = half_basins.ravel()
-    donors = np.empty(8, dtype=np.int32)
-    stream_donors = np.empty(8, dtype=np.int32)
+    donors = np.empty(8, dtype=np.int64)
+    stream_donors = np.empty(8, dtype=np.int64)
     stream_dirs = np.empty(8, dtype=np.int32)
 
     for oi in range(outlets.size):
@@ -1024,7 +1081,7 @@ def find_residual_outlets(receiver: np.ndarray, valid: np.ndarray,
             j = int(rec[i])
             if j < 0 or vf[j] == 0:
                 count += 1
-    out = np.empty(count, dtype=np.int32)
+    out = np.empty(count, dtype=np.int64)
     p = 0
     for i in range(rec.size):
         if vf[i] != 0 and haf[i] == 0:

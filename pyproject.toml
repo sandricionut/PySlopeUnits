@@ -32,7 +32,9 @@ dependencies = [
   "numba>=0.59",
   "rasterio>=1.3",
   "scipy>=1.11",
-  "fiona>=1.9"
+  "fiona>=1.9",
+  "shapely>=2.0",
+  "psutil>=5.9"
 ]
 
 [project.scripts]

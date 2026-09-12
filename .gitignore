@@ -14,6 +14,7 @@ venv/
 .vscode/
 
 # PySlopeUnits runtime / caches
+demodem/
 work/
 output/
 cache/
@@ -43,3 +44,4 @@ memmap/
 
 # Benchmark output
 benchmarks/results/
+.DS_Store

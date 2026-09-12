@@ -11,14 +11,11 @@ import shutil
 import time
 
 import numpy as np
-from numba import set_num_threads
 
 from .halfbasin_parallel import build_half_basins
 from .candidate_cache import MultiThresholdCandidateCache, CandidateKey
 from .kernels import (
-    quantize_dem,
-    aspect_sincos,
-    astar_route,
+    astar_route_preallocated,
     mfd_accumulation,
     stream_mask_grasslike,
     precompute_stream_seed_static,
@@ -32,10 +29,14 @@ from .kernels import (
 )
 from .memmap_store import MemmapStore
 from .parent_eval import evaluate_parent, evaluate_parent_batch, ParentDecision
-from .raster import read_dem, read_meta, RasterMeta, write_raster_blockwise
+from .raster import (
+    read_meta, RasterMeta, write_raster_blockwise,
+    normalize_nodata_values, prepare_dem_memmaps_blockwise,
+)
 from .schedule import threshold_schedule
 from .vector_export import export_geopackage
 from .mfd_parallel import run_mfd_block_parallel
+from .indexing import index_dtype_for_shape, dtype_name
 
 
 @dataclass
@@ -70,7 +71,10 @@ class SlopeUnitsResult:
     total_seconds: float
 
 
-def _manifest_for(dem_path: Path, meta: RasterMeta, convergence: int, scale: int) -> dict:
+def _manifest_for(
+    dem_path: Path, meta: RasterMeta, convergence: int, scale: int,
+    nodata_values=None,
+) -> dict:
     st = dem_path.stat()
     return {
         "dem": str(dem_path.resolve()),
@@ -81,6 +85,12 @@ def _manifest_for(dem_path: Path, meta: RasterMeta, convergence: int, scale: int
         "yres": float(meta.yres),
         "convergence": int(convergence),
         "hydro_scale": int(scale),
+        "nodata_values": [
+            "nan" if np.isnan(v) else float(v)
+            for v in normalize_nodata_values(nodata_values)
+        ],
+        "hydrology_io_version": 3,
+        "index_dtype": dtype_name(index_dtype_for_shape(meta.shape)),
         "engine": "PySlope NumPy+Numba multires 1.0",
     }
 
@@ -89,7 +99,8 @@ def _manifest_matches_dataset(got: dict, expected: dict) -> bool:
     # Engine-version changes should not invalidate expensive A*/MFD arrays.
     keys = [
         "dem", "size", "mtime_ns", "shape", "xres", "yres",
-        "convergence", "hydro_scale",
+        "convergence", "hydro_scale", "nodata_values",
+        "hydrology_io_version", "index_dtype",
     ]
     return all(got.get(k) == expected.get(k) for k in keys)
 
@@ -461,6 +472,9 @@ class SlopeUnits:
         dense_parent_threshold_cells: int = 5_000_000,
         mfd_block_cells: int = 1_000_000,
         resume_partial_hydrology: bool = True,
+        nodata_values=None,
+        memory_budget_bytes: int | None = None,
+        scratch_ram_fraction: float = 0.50,
         verbose: bool = True,
     ):
         if threshold_m2 <= 0:
@@ -492,10 +506,18 @@ class SlopeUnits:
         self.dense_parent_threshold_cells = int(dense_parent_threshold_cells)
         self.mfd_block_cells = max(10_000, int(mfd_block_cells))
         self.resume_partial_hydrology = bool(resume_partial_hydrology)
+        self.nodata_values = normalize_nodata_values(nodata_values)
+        self.memory_budget_bytes = (
+            None if memory_budget_bytes is None else max(0, int(memory_budget_bytes))
+        )
+        self.scratch_ram_fraction = float(scratch_ram_fraction)
         self.verbose = bool(verbose)
 
     def _prepare_hydrology(self, dem_path: Path, store: MemmapStore, meta: RasterMeta):
-        manifest = _manifest_for(dem_path, meta, self.convergence, self.hydro_scale)
+        manifest = _manifest_for(
+            dem_path, meta, self.convergence, self.hydro_scale,
+            self.nodata_values,
+        )
 
         if self.reuse_hydrology and _hydrology_cache_ok(store, manifest):
             if self.verbose:
@@ -546,7 +568,7 @@ class SlopeUnits:
             static_ok.flush(); up_acc.flush()
 
             component = store.create(
-                "drainage_component", meta.shape, np.int32, fill=0
+                "drainage_component", meta.shape, index_dtype_for_shape(meta.shape), fill=0
             )
             if self.verbose:
                 print("[PySlopeUnits] precomputing global drainage components")
@@ -587,59 +609,62 @@ class SlopeUnits:
             nvalid = int(order.size)
 
         else:
-            if self.verbose:
-                print("[PySlopeUnits] reading DEM")
-            grid = read_dem(dem_path)
-            shape = grid.data.shape
-            if shape != meta.shape:
-                raise RuntimeError("DEM shape changed during read")
-
-            valid = store.create("valid", shape, np.uint8)
-            valid[...] = grid.valid.astype(np.uint8)
-            valid.flush()
-            nvalid = int(np.count_nonzero(valid))
-
-            # Terrain circular-statistics components while original DEM is in RAM.
+            shape = meta.shape
             if self.verbose:
                 print(
-                    f"[PySlopeUnits] aspect sin/cos | "
-                    f"Numba threads={self.numba_threads}"
+                    "[PySlopeUnits] preparing DEM out-of-core "
+                    "(blockwise raster -> memmap)"
                 )
-            set_num_threads(self.numba_threads)
-            sin_a = store.create("sin_aspect", shape, np.float32)
-            cos_a = store.create("cos_aspect", shape, np.float32)
-            aspect_valid = store.create("aspect_valid", shape, np.uint8)
-            aspect_sincos(
-                grid.data, valid, meta.xres, meta.yres,
-                sin_a, cos_a, aspect_valid,
+            nvalid = prepare_dem_memmaps_blockwise(
+                dem_path,
+                store,
+                meta,
+                nodata_values=self.nodata_values,
+                hydro_scale=self.hydro_scale,
+                numba_threads=self.numba_threads,
+                max_block_cells=max(250_000, min(2_000_000, self.mfd_block_cells * 2)),
+                verbose=self.verbose,
             )
-            sin_a.flush(); cos_a.flush(); aspect_valid.flush()
+            valid = store.open("valid", "r")
+            hydro_dem = store.open("hydro_dem", "r")
 
+            index_dtype = index_dtype_for_shape(shape)
             if self.verbose:
-                print("[PySlopeUnits] quantizing DEM to 0.001 units")
-            hydro_dem = store.create("hydro_dem", shape, np.int32)
-            quantize_dem(
-                grid.data, valid, hydro_dem, self.hydro_scale
-            )
-            hydro_dem.flush()
-
-            # Free original float64 DEM before routing allocations.
-            del grid
-
+                print(
+                    f"[PySlopeUnits] index dtype | {dtype_name(index_dtype)} | "
+                    f"grid-cells={int(shape[0]) * int(shape[1]):,}"
+                )
             astar_receiver = store.create(
-                "astar_receiver", shape, np.int32, fill=-1
+                "astar_receiver", shape, index_dtype, fill=-1
             )
             edgeflag = store.create(
                 "edgeflag", shape, np.uint8, fill=0
             )
-            order = store.create("order", (nvalid,), np.int32)
+            order = store.create("order", (nvalid,), index_dtype)
+
+            # A* scratch is disk-backed.  The previous implementation allocated
+            # these arrays inside the Numba kernel, which imposed an O(N) RAM
+            # requirement even though all persistent hydrology arrays were
+            # already memory mapped.
+            astar_inlist = store.create_temp(
+                "astar_inlist_tmp", shape, np.uint8, fill=0
+            )
+            astar_worked = store.create_temp(
+                "astar_worked_tmp", shape, np.uint8, fill=0
+            )
+            astar_heap_idx = store.create_temp(
+                "astar_heap_idx_tmp", (nvalid,), index_dtype
+            )
+            astar_heap_age = store.create_temp(
+                "astar_heap_age_tmp", (nvalid,), index_dtype
+            )
 
             if self.verbose:
                 print(
                     f"[PySlopeUnits] GRASS-like A* routing | "
-                    f"Numba | valid={nvalid:,}"
+                    f"hybrid RAM/disk scratch | valid={nvalid:,}"
                 )
-            visited = astar_route(
+            visited = astar_route_preallocated(
                 hydro_dem,
                 valid,
                 meta.xres * self.hydro_scale,
@@ -647,6 +672,10 @@ class SlopeUnits:
                 astar_receiver,
                 order,
                 edgeflag,
+                astar_inlist,
+                astar_worked,
+                astar_heap_idx,
+                astar_heap_age,
             )
             if int(visited) != nvalid:
                 raise RuntimeError(
@@ -655,6 +684,16 @@ class SlopeUnits:
             astar_receiver.flush()
             order.flush()
             edgeflag.flush()
+
+            # Persist routing checkpoint before deleting expendable A* scratch.
+            store.close_many(
+                astar_inlist, astar_worked, astar_heap_idx, astar_heap_age
+            )
+            del astar_inlist, astar_worked, astar_heap_idx, astar_heap_age
+            store.cleanup("astar_inlist_tmp")
+            store.cleanup("astar_worked_tmp")
+            store.cleanup("astar_heap_idx_tmp")
+            store.cleanup("astar_heap_age_tmp")
 
             # Explicit routing checkpoint. If the process is stopped during
             # MFD, the next run resumes here instead of repeating A*.
@@ -746,7 +785,7 @@ class SlopeUnits:
         static_ok.flush(); up_acc.flush()
 
         component = store.create(
-            "drainage_component", shape, np.int32, fill=0
+            "drainage_component", shape, index_dtype_for_shape(shape), fill=0
         )
         if self.verbose:
             print("[PySlopeUnits] precomputing global drainage components")
@@ -799,7 +838,12 @@ class SlopeUnits:
             work_dir = output_path.parent / f"{output_path.stem}_work"
         work_dir = Path(work_dir)
         work_dir.mkdir(parents=True, exist_ok=True)
-        store = MemmapStore(work_dir / "memmap")
+        store = MemmapStore(
+            work_dir / "memmap",
+            ram_budget_bytes=self.memory_budget_bytes,
+            ram_fraction=self.scratch_ram_fraction,
+            verbose=self.verbose,
+        )
         candidate_cache = MultiThresholdCandidateCache(work_dir)
         meta = read_meta(dem_path)
 
@@ -1119,7 +1163,15 @@ class SlopeUnits:
                 "reuse_candidates": self.reuse_candidates,
                 "mfd_block_cells": self.mfd_block_cells,
                 "resume_partial_hydrology": self.resume_partial_hydrology,
+                "nodata_values": [
+                    "nan" if np.isnan(v) else float(v)
+                    for v in self.nodata_values
+                ],
+                "out_of_core_dem_prepare": True,
+                "out_of_core_astar_scratch": True,
                 "dense_parent_threshold_cells": self.dense_parent_threshold_cells,
+                "memory_budget_bytes": self.memory_budget_bytes,
+                "scratch_ram_fraction": self.scratch_ram_fraction,
             },
             "valid_cells": valid_cells,
             "cell_area_m2": meta.cell_area,

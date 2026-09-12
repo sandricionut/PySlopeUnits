@@ -262,7 +262,7 @@ class CandidateDAG:
 
         # Root node 1 is the full valid DEM domain.
         terminal = store.create("v14_terminal_node", shape, np.int32, fill=0)
-        alive = store.create("v14_dag_alive", shape, np.uint8, fill=0)
+        alive = store.create_temp("v14_dag_alive", shape, np.uint8, fill=0)
 
         root_count = 0
         root_acount = 0

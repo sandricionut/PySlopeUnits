@@ -106,7 +106,7 @@ def clump_equal_categories(
     are unioned globally.
     """
     rows, cols = categories.shape
-    provisional = store.create(provisional_name, categories.shape, np.int32, fill=0)
+    provisional = store.create_temp(provisional_name, categories.shape, np.int32, fill=0)
     next_global = 0
     equivalence_chunks: list[np.ndarray] = []
 
