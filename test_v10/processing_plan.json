@@ -1,0 +1,78 @@
+{
+  "mode": "hydrological",
+  "coarse_dem": "test_v10/_work/coarse_dem.tif",
+  "domain_raster": "test_v10/hydro_domains.tif",
+  "domain_vector": null,
+  "target_crs": "EPSG:3035",
+  "fine_resolution_m": 20.0,
+  "coarse_resolution_m": 120.0,
+  "max_fine_cells": 24926149,
+  "max_coarse_cells": 692393,
+  "source_fine_cells_est": 54558612,
+  "domains": [
+    {
+      "domain_id": 1,
+      "coarse_cells": 455797,
+      "estimated_fine_cells": 16408692,
+      "area_m2": 6563476800.0,
+      "bounds": [
+        5518358.347447267,
+        2800499.8179068165,
+        5691398.347447267,
+        2916419.8179068165
+      ],
+      "row_min": 398,
+      "row_max": 1364,
+      "col_min": 56,
+      "col_max": 1498
+    },
+    {
+      "domain_id": 2,
+      "coarse_cells": 230271,
+      "estimated_fine_cells": 8289756,
+      "area_m2": 3315902400.0,
+      "bounds": [
+        5679878.347447267,
+        2650139.8179068165,
+        5732198.347447267,
+        2807939.8179068165
+      ],
+      "row_min": 1302,
+      "row_max": 2617,
+      "col_min": 1402,
+      "col_max": 1838
+    },
+    {
+      "domain_id": 3,
+      "coarse_cells": 673982,
+      "estimated_fine_cells": 24263352,
+      "area_m2": 9705340800.0,
+      "bounds": [
+        5596478.347447267,
+        2640779.8179068165,
+        5722358.347447267,
+        2824499.8179068165
+      ],
+      "row_min": 1164,
+      "row_max": 2695,
+      "col_min": 707,
+      "col_max": 1756
+    },
+    {
+      "domain_id": 4,
+      "coarse_cells": 155467,
+      "estimated_fine_cells": 5596812,
+      "area_m2": 2238724800.0,
+      "bounds": [
+        5524118.347447267,
+        2864339.8179068165,
+        5623838.347447267,
+        2937659.8179068165
+      ],
+      "row_min": 221,
+      "row_max": 832,
+      "col_min": 104,
+      "col_max": 935
+    }
+  ]
+}

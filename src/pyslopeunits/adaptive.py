@@ -196,10 +196,12 @@ def materialize_target_dem(
 class AdaptiveSlopeUnits:
     """Dataset-agnostic, memory-adaptive orchestration.
 
-    The coarse hydrological decomposition is used for resource planning only;
-    it never clips or defines scientific slope-unit boundaries.  The canonical
-    fine DEM is processed with exact global out-of-core hydrology.  The default
-    lazy hierarchy materializes only the active graph frontier and can stream
+    The coarse hydrological decomposition is used as a computational sharding
+    plan only; it never clips or defines scientific slope-unit boundaries. For
+    large datasets the canonical fine DEM uses exact domain-sharded global A*
+    routing: domain-local priority queues are globally arbitrated, preserving
+    the same cross-domain cell order as the single global A* reference. The
+    default lazy hierarchy materializes only the active graph frontier and can stream
     candidate thresholds one at a time when full candidate caching would be
     too expensive.
     """
@@ -545,12 +547,13 @@ class AdaptiveSlopeUnits:
             )
             hierarchy_mode = str(self.slopeunit_kwargs.get("hierarchy_mode", "lazy"))
             if plan.mode == "hydrological":
-                execution_mode = f"adaptive-global-ooc-{hierarchy_mode}"
+                execution_mode = f"adaptive-domain-sharded-ooc-{hierarchy_mode}"
                 if self.verbose:
                     print(
                         "[PySlopeUnits adaptive] large-dataset exact mode | "
                         f"planned hydrological domains={len(plan.domains):,} | "
-                        "global out-of-core hydrology | "
+                        "fine hydrology=domain-sharded exact global A* | "
+                        "MFD=global rank-free block stream | "
                         f"{hierarchy_mode} hierarchical graph"
                     )
             else:
@@ -560,6 +563,9 @@ class AdaptiveSlopeUnits:
             workers=auto_workers,
             numba_threads=auto_numba,
             memory_budget_bytes=execution_memory_budget,
+            hydrology_domain_raster=(
+                plan.domain_raster if plan.mode == "hydrological" else None
+            ),
             verbose=self.verbose,
             **self.slopeunit_kwargs,
         )
@@ -583,8 +589,10 @@ class AdaptiveSlopeUnits:
                     "mode": plan.mode,
                     "planned_domains": len(plan.domains),
                     "scientific_execution": (
-                        "exact global out-of-core hydrology; hydrological domains are "
-                        "resource-planning units and never define slope-unit boundaries; "
+                        "exact domain-sharded global A* for large datasets; hydrological "
+                        "domains are computational queue/storage shards and never define "
+                        "slope-unit boundaries; cross-domain routing order is globally "
+                        "arbitrated; MFD remains exact rank-free global block streaming; "
                         "hierarchy is evaluated lazily unless materialized mode is requested"
                     ),
                     "hierarchy_mode": str(self.slopeunit_kwargs.get("hierarchy_mode", "lazy")),

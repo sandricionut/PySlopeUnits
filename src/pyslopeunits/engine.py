@@ -37,6 +37,7 @@ from .schedule import threshold_schedule
 from .vector_export import export_geopackage
 from .mfd_parallel import run_mfd_block_parallel
 from .indexing import index_dtype_for_shape, dtype_name
+from .fine_hydrology import run_domain_sharded_astar
 
 
 @dataclass
@@ -73,9 +74,19 @@ class SlopeUnitsResult:
 
 def _manifest_for(
     dem_path: Path, meta: RasterMeta, convergence: int, scale: int,
-    nodata_values=None,
+    nodata_values=None, hydrology_domain_raster=None,
 ) -> dict:
     st = dem_path.stat()
+    domain_path = None
+    domain_stat = None
+    if hydrology_domain_raster is not None:
+        dp = Path(hydrology_domain_raster)
+        domain_path = str(dp.resolve())
+        try:
+            dst = dp.stat()
+            domain_stat = {"size": int(dst.st_size), "mtime_ns": int(dst.st_mtime_ns)}
+        except OSError:
+            domain_stat = None
     return {
         "dem": str(dem_path.resolve()),
         "size": int(st.st_size),
@@ -89,8 +100,14 @@ def _manifest_for(
             "nan" if np.isnan(v) else float(v)
             for v in normalize_nodata_values(nodata_values)
         ],
-        "hydrology_io_version": 3,
+        "hydrology_io_version": 4,
         "index_dtype": dtype_name(index_dtype_for_shape(meta.shape)),
+        "routing_mode": (
+            "domain-sharded-global-astar" if hydrology_domain_raster is not None
+            else "global-astar"
+        ),
+        "hydrology_domain_raster": domain_path,
+        "hydrology_domain_raster_stat": domain_stat,
         "engine": "PySlope NumPy+Numba multires 1.0",
     }
 
@@ -100,7 +117,8 @@ def _manifest_matches_dataset(got: dict, expected: dict) -> bool:
     keys = [
         "dem", "size", "mtime_ns", "shape", "xres", "yres",
         "convergence", "hydro_scale", "nodata_values",
-        "hydrology_io_version", "index_dtype",
+        "hydrology_io_version", "index_dtype", "routing_mode",
+        "hydrology_domain_raster", "hydrology_domain_raster_stat",
     ]
     return all(got.get(k) == expected.get(k) for k in keys)
 
@@ -240,6 +258,23 @@ def _partial_astar_cache_ok(store: MemmapStore, meta: RasterMeta) -> bool:
 
     return True
 
+
+
+def _astar_checkpoint_matches_routing(
+    store: MemmapStore,
+    expected: dict,
+) -> bool:
+    path = store.root / "astar_checkpoint.json"
+    if not path.exists():
+        return False
+    try:
+        info = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return (
+        info.get("routing_mode") == expected.get("routing_mode")
+        and info.get("hydrology_domain_raster") == expected.get("hydrology_domain_raster")
+    )
 
 def _array_shape_ok(store: MemmapStore, name: str, shape) -> bool:
     if not store.exists(name):
@@ -475,6 +510,7 @@ class SlopeUnits:
         nodata_values=None,
         memory_budget_bytes: int | None = None,
         scratch_ram_fraction: float = 0.50,
+        hydrology_domain_raster: str | Path | None = None,
         verbose: bool = True,
     ):
         if threshold_m2 <= 0:
@@ -511,12 +547,15 @@ class SlopeUnits:
             None if memory_budget_bytes is None else max(0, int(memory_budget_bytes))
         )
         self.scratch_ram_fraction = float(scratch_ram_fraction)
+        self.hydrology_domain_raster = (
+            None if hydrology_domain_raster is None else Path(hydrology_domain_raster)
+        )
         self.verbose = bool(verbose)
 
     def _prepare_hydrology(self, dem_path: Path, store: MemmapStore, meta: RasterMeta):
         manifest = _manifest_for(
             dem_path, meta, self.convergence, self.hydro_scale,
-            self.nodata_values,
+            self.nodata_values, self.hydrology_domain_raster,
         )
 
         if self.reuse_hydrology and _hydrology_cache_ok(store, manifest):
@@ -593,6 +632,7 @@ class SlopeUnits:
         resumed_astar = (
             self.resume_partial_hydrology
             and _partial_astar_cache_ok(store, meta)
+            and _astar_checkpoint_matches_routing(store, manifest)
         )
         edgeflag = None
 
@@ -642,41 +682,71 @@ class SlopeUnits:
             )
             order = store.create("order", (nvalid,), index_dtype)
 
-            # A* scratch is disk-backed.  The previous implementation allocated
-            # these arrays inside the Numba kernel, which imposed an O(N) RAM
-            # requirement even though all persistent hydrology arrays were
-            # already memory mapped.
-            astar_inlist = store.create_temp(
-                "astar_inlist_tmp", shape, np.uint8, fill=0
-            )
-            astar_worked = store.create_temp(
-                "astar_worked_tmp", shape, np.uint8, fill=0
-            )
-            astar_heap_idx = store.create_temp(
-                "astar_heap_idx_tmp", (nvalid,), index_dtype
-            )
-            astar_heap_age = store.create_temp(
-                "astar_heap_age_tmp", (nvalid,), index_dtype
-            )
-
-            if self.verbose:
-                print(
-                    f"[PySlopeUnits] GRASS-like A* routing | "
-                    f"hybrid RAM/disk scratch | valid={nvalid:,}"
+            if self.hydrology_domain_raster is not None:
+                # V10: exact global A* semantics with the priority queue sharded
+                # by coarse hydrological processing domains. Domains are queue
+                # and storage shards only; global arbitration preserves the exact
+                # cross-domain processing order.
+                astar_result = run_domain_sharded_astar(
+                    store,
+                    meta=meta,
+                    domain_raster=self.hydrology_domain_raster,
+                    hydro_dem=hydro_dem,
+                    valid=valid,
+                    receiver=astar_receiver,
+                    order=order,
+                    edgeflag=edgeflag,
+                    nvalid=nvalid,
+                    xres_scaled=meta.xres * self.hydro_scale,
+                    yres_scaled=meta.yres * self.hydro_scale,
+                    index_dtype=index_dtype,
+                    verbose=self.verbose,
                 )
-            visited = astar_route_preallocated(
-                hydro_dem,
-                valid,
-                meta.xres * self.hydro_scale,
-                meta.yres * self.hydro_scale,
-                astar_receiver,
-                order,
-                edgeflag,
-                astar_inlist,
-                astar_worked,
-                astar_heap_idx,
-                astar_heap_age,
-            )
+                visited = int(astar_result.visited_cells)
+            else:
+                # Original exact single-global-heap A* retained for direct and
+                # small-dataset runs and as the regression reference.
+                astar_inlist = store.create_temp(
+                    "astar_inlist_tmp", shape, np.uint8, fill=0
+                )
+                astar_worked = store.create_temp(
+                    "astar_worked_tmp", shape, np.uint8, fill=0
+                )
+                astar_heap_idx = store.create_temp(
+                    "astar_heap_idx_tmp", (nvalid,), index_dtype
+                )
+                astar_heap_age = store.create_temp(
+                    "astar_heap_age_tmp", (nvalid,), index_dtype
+                )
+
+                if self.verbose:
+                    print(
+                        f"[PySlopeUnits] GRASS-like A* routing | "
+                        f"hybrid RAM/disk scratch | valid={nvalid:,}"
+                    )
+                visited = astar_route_preallocated(
+                    hydro_dem,
+                    valid,
+                    meta.xres * self.hydro_scale,
+                    meta.yres * self.hydro_scale,
+                    astar_receiver,
+                    order,
+                    edgeflag,
+                    astar_inlist,
+                    astar_worked,
+                    astar_heap_idx,
+                    astar_heap_age,
+                )
+
+                store.close_many(
+                    astar_inlist, astar_worked, astar_heap_idx, astar_heap_age
+                )
+                del astar_inlist, astar_worked, astar_heap_idx, astar_heap_age
+                store.cleanup("astar_inlist_tmp")
+                store.cleanup("astar_worked_tmp")
+                store.cleanup("astar_heap_idx_tmp")
+                store.cleanup("astar_heap_age_tmp")
+
             if int(visited) != nvalid:
                 raise RuntimeError(
                     f"A* visited {visited:,} cells, expected {nvalid:,}"
@@ -684,16 +754,6 @@ class SlopeUnits:
             astar_receiver.flush()
             order.flush()
             edgeflag.flush()
-
-            # Persist routing checkpoint before deleting expendable A* scratch.
-            store.close_many(
-                astar_inlist, astar_worked, astar_heap_idx, astar_heap_age
-            )
-            del astar_inlist, astar_worked, astar_heap_idx, astar_heap_age
-            store.cleanup("astar_inlist_tmp")
-            store.cleanup("astar_worked_tmp")
-            store.cleanup("astar_heap_idx_tmp")
-            store.cleanup("astar_heap_age_tmp")
 
             # Explicit routing checkpoint. If the process is stopped during
             # MFD, the next run resumes here instead of repeating A*.
@@ -704,6 +764,8 @@ class SlopeUnits:
                     "shape": list(meta.shape),
                     "valid_cells": nvalid,
                     "hydro_scale": self.hydro_scale,
+                    "routing_mode": manifest["routing_mode"],
+                    "hydrology_domain_raster": manifest["hydrology_domain_raster"],
                 },
             )
 

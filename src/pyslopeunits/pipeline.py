@@ -78,6 +78,7 @@ class SlopeUnits:
         nodata_values=None,
         memory_budget_bytes: int | None = None,
         scratch_ram_fraction: float = 0.50,
+        hydrology_domain_raster: str | Path | None = None,
 
         verbose: bool = True,
     ):
@@ -116,6 +117,9 @@ class SlopeUnits:
             None if memory_budget_bytes is None else max(0, int(memory_budget_bytes))
         )
         self.scratch_ram_fraction = float(scratch_ram_fraction)
+        self.hydrology_domain_raster = (
+            None if hydrology_domain_raster is None else Path(hydrology_domain_raster)
+        )
 
         self.verbose = bool(verbose)
 
@@ -179,6 +183,7 @@ class SlopeUnits:
                 nodata_values=self.nodata_values,
                 memory_budget_bytes=self.memory_budget_bytes,
                 scratch_ram_fraction=self.scratch_ram_fraction,
+                hydrology_domain_raster=self.hydrology_domain_raster,
                 verbose=self.verbose,
             ).run(dem_path, work_dir)
         else:
@@ -200,6 +205,7 @@ class SlopeUnits:
                 nodata_values=self.nodata_values,
                 memory_budget_bytes=self.memory_budget_bytes,
                 scratch_ram_fraction=self.scratch_ram_fraction,
+                hydrology_domain_raster=self.hydrology_domain_raster,
                 verbose=self.verbose,
             )
             hydro._prepare_hydrology(dem_path, store, meta)

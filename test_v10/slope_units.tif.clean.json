@@ -1,0 +1,16 @@
+{
+  "input_raster": "test_v10/slope_units_raw.tif",
+  "output_raster": "test_v10/slope_units.tif",
+  "method": "grass_quick",
+  "clean_size_m2": 25000.0,
+  "cell_area_m2": 400.0,
+  "clean_size_cells": 62.5,
+  "grow_radius_cells": 14,
+  "initial_units": 126457,
+  "removed_small_units": 64081,
+  "removed_small_cells": 501308,
+  "cells_unfilled_after_basic": 206,
+  "cells_unfilled_after_quick": 0,
+  "final_units": 65607,
+  "total_seconds": 27.101488749991404
+}

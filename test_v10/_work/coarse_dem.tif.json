@@ -1,0 +1,17 @@
+{
+  "source": "demodem/LiDAR_DTM_gauss_20m.tif",
+  "source_crs": "EPSG:3857",
+  "source_width": 11713,
+  "source_height": 23639,
+  "source_bounds": [
+    2914799.3627000004,
+    5681211.496200003,
+    3149059.3627000004,
+    6153991.496200003
+  ],
+  "target_crs": "EPSG:3035",
+  "resolution_m": 120.0,
+  "width": 1898,
+  "height": 2941,
+  "resampling": "average"
+}

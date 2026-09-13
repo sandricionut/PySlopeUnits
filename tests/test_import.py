@@ -1,7 +1,7 @@
 def test_package_imports():
     import pyslopeunits
 
-    assert pyslopeunits.__version__ == "0.1.0"
+    assert pyslopeunits.__version__ == "0.1.2"
     assert pyslopeunits.SlopeUnits is not None
 
 
