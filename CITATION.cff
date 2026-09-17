@@ -1,11 +1,10 @@
 cff-version: 1.2.0
-message: "If you use PySlopeUnits, please cite the software and the associated paper."
+message: "If you use PySlopeUnits, please cite the software release and the associated manuscript."
 title: "PySlopeUnits"
 type: software
 authors:
   - family-names: "Sandric"
     given-names: "Ionut"
-version: "0.1.0"
-date-released: "2026-09-07"
-repository-code: "https://github.com/REPLACE_WITH_ACCOUNT/PySlopeUnits"
-abstract: "A hierarchical graph-based algorithm for scalable slope-unit delineation from massive digital elevation models."
+version: "0.1.8"
+date-released: 2026-09-17
+abstract: "A hierarchical graph-based framework for scalable slope-unit delineation from massive digital elevation models."

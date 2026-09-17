@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .logging_utils import log as print
+
 from dataclasses import dataclass, asdict
 from pathlib import Path
 import json
@@ -79,6 +81,9 @@ class SlopeUnits:
         memory_budget_bytes: int | None = None,
         scratch_ram_fraction: float = 0.50,
         hydrology_domain_raster: str | Path | None = None,
+        checkpoint: bool = True,
+        checkpoint_minutes: float = 15.0,
+        restart: bool = False,
 
         verbose: bool = True,
     ):
@@ -120,6 +125,11 @@ class SlopeUnits:
         self.hydrology_domain_raster = (
             None if hydrology_domain_raster is None else Path(hydrology_domain_raster)
         )
+        self.checkpoint = bool(checkpoint)
+        self.checkpoint_minutes = float(checkpoint_minutes)
+        if self.checkpoint_minutes <= 0:
+            raise ValueError("checkpoint_minutes must be > 0")
+        self.restart = bool(restart)
 
         self.verbose = bool(verbose)
 
@@ -184,6 +194,9 @@ class SlopeUnits:
                 memory_budget_bytes=self.memory_budget_bytes,
                 scratch_ram_fraction=self.scratch_ram_fraction,
                 hydrology_domain_raster=self.hydrology_domain_raster,
+                checkpoint=self.checkpoint,
+                checkpoint_minutes=self.checkpoint_minutes,
+                restart=self.restart,
                 verbose=self.verbose,
             ).run(dem_path, work_dir)
         else:
@@ -206,6 +219,9 @@ class SlopeUnits:
                 memory_budget_bytes=self.memory_budget_bytes,
                 scratch_ram_fraction=self.scratch_ram_fraction,
                 hydrology_domain_raster=self.hydrology_domain_raster,
+                checkpoint=self.checkpoint,
+                checkpoint_minutes=self.checkpoint_minutes,
+                restart=self.restart,
                 verbose=self.verbose,
             )
             hydro._prepare_hydrology(dem_path, store, meta)

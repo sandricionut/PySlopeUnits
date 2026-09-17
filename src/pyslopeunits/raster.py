@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .logging_utils import log as print
+
 from dataclasses import dataclass
 from pathlib import Path
 import json

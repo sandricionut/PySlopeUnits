@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .logging_utils import log as print
+
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, asdict
 import gc
@@ -13,14 +15,15 @@ from numba import njit, set_num_threads
 from .kernels import (
     DR,
     DC,
-    init_mfd_valid_serial,
+    init_mfd_accum_state_spatial_parallel,
+    init_mfd_receiver_spatial_parallel,
     mfd_scatter_block_serial,
 )
 from .memmap_store import MemmapStore
 
 
 # ============================================================================
-# V09
+# 
 #
 # Exact rank-free MFD.
 #
@@ -28,7 +31,7 @@ from .memmap_store import MemmapStore
 #   old:
 #       global mfd_rank[cell] -> topological rank
 #
-#   v09:
+#   rank-free:
 #       uint8 state raster
 #       + temporary hash only for the current order block
 #
@@ -58,6 +61,7 @@ class MFDParallelResult:
     blocks: int
     block_cells: int
     workers: int
+    initialization_seconds: float
     weight_seconds_waited: float
     scatter_seconds: float
     adjusted_receiver_seconds: float
@@ -121,6 +125,51 @@ def _next_power_of_two(v: int) -> int:
         out <<= 1
 
     return out
+
+
+def _persist_accumulation_working_set(
+    store: MemmapStore,
+    working,
+    *,
+    work_name: str = "mfd_accumulation_work",
+    output_name: str = "accumulation",
+    copy_block_bytes: int = 128 * 1024**2,
+):
+    """Promote the exact working accumulation to the persistent product.
+
+    RAM-backed scratch is copied once, sequentially, into the persistent NPY.
+    Disk-backed scratch is atomically renamed after its mapping is closed,
+    avoiding a second full-file copy.  The returned array is an ``r+`` memmap
+    suitable for the remainder of MFD and for later cache reuse.
+    """
+    backend = store.backend(working)
+    shape = tuple(working.shape)
+    dtype = np.dtype(working.dtype)
+
+    if backend == "ram":
+        output = store.create(output_name, shape, dtype)
+        src = working.reshape(working.size)
+        dst = output.reshape(output.size)
+        cells_per_block = max(1, int(copy_block_bytes) // dtype.itemsize)
+        for start in range(0, src.size, cells_per_block):
+            stop = min(src.size, start + cells_per_block)
+            dst[start:stop] = src[start:stop]
+        output.flush()
+        store.release_temp(work_name)
+        return output, backend
+
+    # Disk scratch already contains the complete exact product.  Close the
+    # current mapping before replacing/renaming files (required on Windows).
+    _close_memmap(working)
+    del working
+    gc.collect()
+
+    src_path = store.path(work_name)
+    dst_path = store.path(output_name)
+    store.remove(output_name, best_effort=False)
+    os.replace(src_path, dst_path)
+    output = store.open(output_name, "r+")
+    return output, backend
 
 
 # ============================================================================
@@ -332,7 +381,7 @@ def _mfd_weights_rankfree_slice(
     Old test:
         rank[j] < rank[i]
 
-    V09 equivalent during reverse traversal:
+     equivalent during reverse traversal:
         previous reverse block -> state[j] == 1 -> NOT eligible
         current block:
             local_j > local_i -> eligible
@@ -360,7 +409,7 @@ def _mfd_weights_rankfree_slice(
         r = i // cols
         c = i - r * cols
 
-        # Same edge semantics as V08.
+        # Same edge semantics as reference.
         if r == 0 or c == 0 or r == rows - 1 or c == cols - 1:
             continue
 
@@ -445,7 +494,7 @@ def _mfd_weights_rankfree_slice(
             if j == astar_j:
                 astar_present = True
 
-        # Preserve V08 A* fallback semantics exactly.
+        # Preserve reference A* fallback semantics exactly.
         if astar_j >= 0 and not astar_present:
             if maxw <= 0.0:
                 maxw = 1.0
@@ -613,10 +662,10 @@ def _compute_weight_slice_worker(
         valid = store.open("valid", "r")
         astar = store.open("astar_receiver", "r")
         order = store.open("order", "r")
-        state = store.open("mfd_v09_state", "r")
-        keys = store.open("mfd_v09_hash_keys", "r")
-        values = store.open("mfd_v09_hash_values", "r")
-        tags = store.open("mfd_v09_hash_tags", "r")
+        state = store.open("mfd_rankfree_state", "r")
+        keys = store.open("mfd_rankfree_hash_keys", "r")
+        values = store.open("mfd_rankfree_hash_values", "r")
+        tags = store.open("mfd_rankfree_hash_tags", "r")
         weights = store.open(weight_name, "r+")
 
         _mfd_weights_rankfree_slice(
@@ -657,7 +706,7 @@ def _compute_weight_slice_worker(
             _close_memmap(arr)
 
 
-def _adjusted_receiver_worker_v09(
+def _adjusted_receiver_worker_rankfree(
     root: str,
     generation: int,
     forward_offset: int,
@@ -680,10 +729,10 @@ def _adjusted_receiver_worker_v09(
         valid = store.open("valid", "r")
         astar = store.open("astar_receiver", "r")
         order = store.open("order", "r")
-        state = store.open("mfd_v09_state", "r")
-        keys = store.open("mfd_v09_hash_keys", "r")
-        values = store.open("mfd_v09_hash_values", "r")
-        tags = store.open("mfd_v09_hash_tags", "r")
+        state = store.open("mfd_rankfree_state", "r")
+        keys = store.open("mfd_rankfree_hash_keys", "r")
+        values = store.open("mfd_rankfree_hash_values", "r")
+        tags = store.open("mfd_rankfree_hash_tags", "r")
         accumulation = store.open("accumulation", "r")
         receiver = store.open("receiver", "r+")
 
@@ -780,7 +829,7 @@ def _submit_adjusted_block(
     for k0, k1 in _split_ranges(block_len, workers):
         futures.append(
             pool.submit(
-                _adjusted_receiver_worker_v09,
+                _adjusted_receiver_worker_rankfree,
                 str(store.root),
                 int(generation),
                 int(forward_offset),
@@ -810,7 +859,7 @@ def run_mfd_block_parallel(
     verbose: bool = True,
 ) -> MFDParallelResult:
     """
-    V09 exact rank-free block-parallel MFD.
+     exact rank-free block-parallel MFD.
 
     Public function name and signature intentionally remain unchanged so
     engine.py does not need a hydrology API change.
@@ -820,19 +869,20 @@ def run_mfd_block_parallel(
     workers = max(1, int(workers))
 
     # ------------------------------------------------------------
-    # Clear only V09 temporary arrays.
+    # Clear only  temporary arrays.
     #
     # We intentionally do NOT use the old mfd_weights_* names because
     # engine.py recognizes those names as a legacy Windows Stage-11
     # recovery signature.
     # ------------------------------------------------------------
     for name in (
-        "mfd_v09_state",
-        "mfd_v09_hash_keys",
-        "mfd_v09_hash_values",
-        "mfd_v09_hash_tags",
-        "mfd_v09_weights_0",
-        "mfd_v09_weights_1",
+        "mfd_rankfree_state",
+        "mfd_rankfree_hash_keys",
+        "mfd_rankfree_hash_values",
+        "mfd_rankfree_hash_tags",
+        "mfd_rankfree_weights_0",
+        "mfd_rankfree_weights_1",
+        "mfd_accumulation_work",
     ):
         _cleanup_temp(store, name)
 
@@ -843,35 +893,71 @@ def run_mfd_block_parallel(
 
     nv = int(order.size)
 
-    # Preserve the index dtype chosen by V08.
+    # Preserve the index dtype chosen by reference.
     index_dtype = np.dtype(astar.dtype)
 
-    accumulation = store.create(
-        "accumulation",
+    # ------------------------------------------------------------------
+    # Spatially contiguous parallel MFD initialization.
+    #
+    # Do not initialize valid cells by A* order here.  A* order is hydrologic
+    # rather than spatial and causes scattered memmap writes on large DEMs.
+    # A single raster-index scan reads ``valid`` and ``astar_receiver`` and
+    # writes all MFD arrays contiguously.  The numerical state is identical.
+    # ------------------------------------------------------------------
+    if verbose:
+        print(
+            "[PySlopeUnits] MFD initialization START | "
+            f"spatial-contiguous | grid-cells={dem.size:,} | valid={nv:,} | "
+            f"Numba threads={max(1, int(numba_threads))}"
+        )
+
+    init_t0 = time.perf_counter()
+
+    # ``accumulation`` is the only large array that receives hydrologically
+    # scattered writes during phase 1.  Allocate it as local adaptive scratch:
+    # RAM when the configured resource budget and current free memory allow,
+    # otherwise an exact disk-backed fallback.  It becomes persistent only
+    # after propagation is complete.
+    accumulation = store.create_temp(
+        "mfd_accumulation_work",
         dem.shape,
         np.float64,
-        fill=0.0,
+        prefer_ram=True,
     )
 
-    receiver = store.create(
-        "receiver",
-        dem.shape,
-        index_dtype,
-        fill=-1,
-    )
-
-    # One byte/cell instead of global int32/int64 rank.
-    state = store.create(
-        "mfd_v09_state",
+    # One byte/cell instead of global int32/int64 rank.  Workers must reopen
+    # this array, therefore it remains shared/file-backed.
+    state = store.create_shared(
+        "mfd_rankfree_state",
         dem.shape,
         np.uint8,
-        fill=0,
     )
 
-    init_mfd_valid_serial(order, astar, accumulation, receiver)
+    init_mfd_accum_state_spatial_parallel(
+        valid,
+        accumulation,
+        state,
+    )
 
     accumulation.flush()
-    receiver.flush()
+    state.flush()
+
+    initialization_seconds = time.perf_counter() - init_t0
+
+    accumulation_work_backend = store.backend(accumulation)
+
+    if verbose:
+        print(
+            "[PySlopeUnits] MFD initialization END | "
+            f"elapsed={initialization_seconds / 60:.2f} min | "
+            f"accumulation-work={accumulation_work_backend.upper()} | "
+            f"size={accumulation.nbytes / 1024**3:.2f} GB"
+        )
+        if accumulation_work_backend == "disk":
+            print(
+                "[PySlopeUnits] MFD accumulation working set exceeds safe RAM "
+                "budget; using exact out-of-core fallback"
+            )
 
     block_cells = max(50_000, int(block_cells))
     nblocks = (nv + block_cells - 1) // block_cells
@@ -887,41 +973,41 @@ def run_mfd_block_parallel(
     hash_capacity = _next_power_of_two(max(8, capacity * 2))
 
     hash_keys = store.create(
-        "mfd_v09_hash_keys",
+        "mfd_rankfree_hash_keys",
         (hash_capacity,),
         np.int64,
         fill=0,
     )
 
     hash_values = store.create(
-        "mfd_v09_hash_values",
+        "mfd_rankfree_hash_values",
         (hash_capacity,),
         np.int32,
         fill=0,
     )
 
     hash_tags = store.create(
-        "mfd_v09_hash_tags",
+        "mfd_rankfree_hash_tags",
         (hash_capacity,),
         np.int32,
         fill=0,
     )
 
     w0 = store.create(
-        "mfd_v09_weights_0",
+        "mfd_rankfree_weights_0",
         (capacity, 9),
         np.float64,
     )
 
     w1 = store.create(
-        "mfd_v09_weights_1",
+        "mfd_rankfree_weights_1",
         (capacity, 9),
         np.float64,
     )
 
     weight_names = (
-        "mfd_v09_weights_0",
-        "mfd_v09_weights_1",
+        "mfd_rankfree_weights_0",
+        "mfd_rankfree_weights_1",
     )
 
     if verbose:
@@ -929,12 +1015,12 @@ def run_mfd_block_parallel(
         state_bytes = int(np.prod(dem.shape)) * np.dtype(np.uint8).itemsize
 
         print(
-            "[PySlopeUnits] MFD V09 | exact rank-free block-parallel | "
+            "[PySlopeUnits] MFD START | exact rank-free block-parallel | "
             f"valid={nv:,}"
         )
 
         print(
-            "[PySlopeUnits] MFD V09 storage | "
+            "[PySlopeUnits] MFD storage | "
             f"old-rank={old_rank_bytes / 1024**3:.2f} GB | "
             f"state={state_bytes / 1024**3:.2f} GB | "
             f"block-hash={hash_capacity:,} slots"
@@ -960,27 +1046,12 @@ def run_mfd_block_parallel(
         w0,
     )
 
-    _adjusted_receiver_rankfree_slice(
-        valid,
-        astar,
-        order,
-        state,
-        hash_keys,
-        hash_values,
-        hash_tags,
-        1,
-        accumulation,
-        receiver,
-        0,
-        0,
-        0,
-    )
-
     t0 = time.perf_counter()
 
     weight_wait = 0.0
     scatter_seconds = 0.0
     adjusted_seconds = 0.0
+    persistence_seconds = 0.0
 
     next_report = max(1, int(progress_percent))
     generation = 1
@@ -1038,7 +1109,7 @@ def run_mfd_block_parallel(
 
             # ----------------------------------------------------
             # Prepare next weight calculation before scattering the
-            # current block. This retains V08's pipeline overlap.
+            # current block. This retains reference's pipeline overlap.
             # ----------------------------------------------------
 
             next_futures = None
@@ -1074,7 +1145,7 @@ def run_mfd_block_parallel(
             # ----------------------------------------------------
             # Exact accumulation scatter.
             #
-            # We deliberately keep the V08 kernel here.
+            # We deliberately keep the reference kernel here.
             # ----------------------------------------------------
 
             current_weights = store.open(weight_names[cur_buf], "r")
@@ -1126,6 +1197,53 @@ def run_mfd_block_parallel(
 
         accumulation.flush()
 
+        # Materialize the persistent accumulation exactly once.  RAM working
+        # sets are streamed sequentially; disk working sets are promoted by
+        # rename, so the write-intensive phase never needs a second random-write
+        # persistent mapping.
+        persist_t0 = time.perf_counter()
+        accumulation, accumulation_work_backend = _persist_accumulation_working_set(
+            store,
+            accumulation,
+        )
+        persistence_seconds = time.perf_counter() - persist_t0
+
+        # Receiver is not needed during accumulation.  Creating it here removes
+        # a large writable mapping from phase 1 and preserves the exact initial
+        # A* receiver values used for edge cells.
+        receiver = store.create(
+            "receiver",
+            dem.shape,
+            index_dtype,
+        )
+        init_mfd_receiver_spatial_parallel(valid, astar, receiver)
+        receiver.flush()
+
+        # Compile the adjusted-receiver kernel in the parent only after its
+        # arrays exist; workers then reuse Numba's on-disk cache.
+        _adjusted_receiver_rankfree_slice(
+            valid,
+            astar,
+            order,
+            state,
+            hash_keys,
+            hash_values,
+            hash_tags,
+            generation + 1,
+            accumulation,
+            receiver,
+            0,
+            0,
+            0,
+        )
+
+        if verbose:
+            print(
+                "[PySlopeUnits] MFD accumulation persisted | "
+                f"source={accumulation_work_backend.upper()} | "
+                f"elapsed={persistence_seconds / 60:.2f} min"
+            )
+
         # ========================================================
         # PHASE 2:
         # adjusted drainage receiver
@@ -1140,7 +1258,7 @@ def run_mfd_block_parallel(
 
         if verbose:
             print(
-                "[PySlopeUnits] MFD V09 adjusted receiver | "
+                "[PySlopeUnits] MFD adjusted receiver | "
                 f"rank-free block-parallel | workers={workers}"
             )
 
@@ -1201,6 +1319,7 @@ def run_mfd_block_parallel(
         blocks=nblocks,
         block_cells=block_cells,
         workers=workers,
+        initialization_seconds=initialization_seconds,
         weight_seconds_waited=weight_wait,
         scatter_seconds=scatter_seconds,
         adjusted_receiver_seconds=adjusted_seconds,
@@ -1222,7 +1341,7 @@ def run_mfd_block_parallel(
             "blocks": int(nblocks),
             "block_cells": int(block_cells),
             "workers": int(workers),
-            "algorithm": "v09-rankfree-block-hash",
+            "algorithm": "exact-rankfree-block-mfd-v018",
         },
     )
 
@@ -1254,12 +1373,13 @@ def run_mfd_block_parallel(
     gc.collect()
 
     for name in (
-        "mfd_v09_state",
-        "mfd_v09_hash_keys",
-        "mfd_v09_hash_values",
-        "mfd_v09_hash_tags",
-        "mfd_v09_weights_0",
-        "mfd_v09_weights_1",
+        "mfd_rankfree_state",
+        "mfd_rankfree_hash_keys",
+        "mfd_rankfree_hash_values",
+        "mfd_rankfree_hash_tags",
+        "mfd_rankfree_weights_0",
+        "mfd_rankfree_weights_1",
+        "mfd_accumulation_work",
     ):
         _cleanup_temp(store, name)
 
@@ -1287,9 +1407,11 @@ def run_mfd_block_parallel(
 
     if verbose:
         print(
-            "[PySlopeUnits] MFD V09 complete | "
-            f"total={total / 60:.2f} min | "
+            "[PySlopeUnits] MFD END | "
+            f"init={initialization_seconds / 60:.2f} min | "
+            f"compute={total / 60:.2f} min | "
             f"scatter={scatter_seconds / 60:.2f} min | "
+            f"persist={persistence_seconds / 60:.2f} min | "
             f"weight_wait={weight_wait / 60:.2f} min | "
             f"adjusted={adjusted_seconds / 60:.2f} min | "
             f"adjust_pids={adjusted_pids}"

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .logging_utils import log as print
+
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -68,6 +70,9 @@ class CandidateHierarchyPrecomputer:
         memory_budget_bytes: int | None = None,
         scratch_ram_fraction: float = 0.50,
         hydrology_domain_raster: str | Path | None = None,
+        checkpoint: bool = True,
+        checkpoint_minutes: float = 15.0,
+        restart: bool = False,
         verbose: bool = True,
     ):
         self.threshold_m2 = float(threshold_m2)
@@ -86,6 +91,9 @@ class CandidateHierarchyPrecomputer:
         self.hydrology_domain_raster = (
             None if hydrology_domain_raster is None else Path(hydrology_domain_raster)
         )
+        self.checkpoint = bool(checkpoint)
+        self.checkpoint_minutes = float(checkpoint_minutes)
+        self.restart = bool(restart)
         self.verbose = bool(verbose)
 
     def run(self, dem_path, work_dir) -> CandidatePreparationResult:
@@ -123,6 +131,9 @@ class CandidateHierarchyPrecomputer:
             memory_budget_bytes=self.memory_budget_bytes,
             scratch_ram_fraction=self.scratch_ram_fraction,
             hydrology_domain_raster=self.hydrology_domain_raster,
+            checkpoint=self.checkpoint,
+            checkpoint_minutes=self.checkpoint_minutes,
+            restart=self.restart,
             verbose=self.verbose,
         )
         model._prepare_hydrology(dem_path, store, meta)

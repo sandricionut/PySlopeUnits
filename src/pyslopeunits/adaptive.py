@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .logging_utils import log as print
+
 from dataclasses import asdict, dataclass
 from pathlib import Path
 import json
@@ -220,6 +222,9 @@ class AdaptiveSlopeUnits:
         workers: int | None = None,
         numba_threads: int | None = None,
         nodata_values=None,
+        checkpoint: bool = True,
+        checkpoint_minutes: float = 15.0,
+        restart: bool = False,
         verbose: bool = True,
         **slopeunit_kwargs,
     ):
@@ -238,6 +243,11 @@ class AdaptiveSlopeUnits:
         self.workers = workers
         self.numba_threads = numba_threads
         self.nodata_values = normalize_nodata_values(nodata_values)
+        self.checkpoint = bool(checkpoint)
+        self.checkpoint_minutes = float(checkpoint_minutes)
+        if self.checkpoint_minutes <= 0:
+            raise ValueError("checkpoint_minutes must be > 0")
+        self.restart = bool(restart)
         self.verbose = bool(verbose)
         self.slopeunit_kwargs = dict(slopeunit_kwargs)
         self.slopeunit_kwargs["nodata_values"] = self.nodata_values
@@ -245,7 +255,7 @@ class AdaptiveSlopeUnits:
     def _effective_source(self, source, output_dir: Path) -> str:
         return normalize_source_nodata(
             source,
-            output_dir / "_work" / "source_nodata_normalized.tif",
+            output_dir / "workspace" / "planning" / "source_nodata_normalized.tif",
             nodata_values=self.nodata_values,
             verbose=self.verbose,
         )
@@ -330,7 +340,7 @@ class AdaptiveSlopeUnits:
     def plan(self, source, output_dir: str | Path) -> HydrologicalDomainPlan:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        work_dir = output_dir / "_work"
+        work_dir = output_dir / "workspace" / "planning"
         work_dir.mkdir(parents=True, exist_ok=True)
 
         effective_source = self._effective_source(source, output_dir)
@@ -521,7 +531,7 @@ class AdaptiveSlopeUnits:
         effective_source = self._effective_source(source, output_dir)
 
         out_path = output_dir / "slope_units.tif"
-        work_path = output_dir / "work"
+        work_path = output_dir / "workspace" / "engine"
         if skip_existing and out_path.exists():
             return AdaptiveRunResult(
                 output_dir=output_dir,
@@ -540,7 +550,7 @@ class AdaptiveSlopeUnits:
         else:
             fine_dem = materialize_target_dem(
                 effective_source,
-                output_dir / "_work" / "canonical_fine_dem.tif",
+                output_dir / "workspace" / "planning" / "canonical_fine_dem.tif",
                 target_crs=self.target_crs,
                 fine_resolution_m=self.fine_resolution_m,
                 verbose=self.verbose,
@@ -566,6 +576,9 @@ class AdaptiveSlopeUnits:
             hydrology_domain_raster=(
                 plan.domain_raster if plan.mode == "hydrological" else None
             ),
+            checkpoint=self.checkpoint,
+            checkpoint_minutes=self.checkpoint_minutes,
+            restart=self.restart,
             verbose=self.verbose,
             **self.slopeunit_kwargs,
         )
@@ -588,6 +601,11 @@ class AdaptiveSlopeUnits:
                     "plan_file": str(result.plan_file),
                     "mode": plan.mode,
                     "planned_domains": len(plan.domains),
+                    "workspace": {
+                        "root": str(output_dir / "workspace"),
+                        "planning": str(output_dir / "workspace" / "planning"),
+                        "engine": str(output_dir / "workspace" / "engine"),
+                    },
                     "scientific_execution": (
                         "exact domain-sharded global A* for large datasets; hydrological "
                         "domains are computational queue/storage shards and never define "

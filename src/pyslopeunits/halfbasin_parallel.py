@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .logging_utils import log as print
+
 import gc
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed

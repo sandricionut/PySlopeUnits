@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .logging_utils import log as print
+
 """Bounded-memory lazy evaluation of the PySlopeUnits candidate hierarchy.
 
 The scientific hierarchy is identical to :mod:`pyslopeunits.dag`, but only

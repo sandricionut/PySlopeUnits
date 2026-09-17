@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .logging_utils import log as print
+
 from pathlib import Path
 import numpy as np
 from numba import njit

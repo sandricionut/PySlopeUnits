@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .logging_utils import log as print
+
 import argparse
 from pathlib import Path
 
@@ -59,6 +61,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--numba-threads", type=int, default=0, help="0 = auto")
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--no-skip-existing", action="store_true")
+    parser.add_argument(
+        "--checkpoint-minutes",
+        type=float,
+        default=15.0,
+        help="Checkpoint interval for long-running stages (default: 15 minutes).",
+    )
+    parser.add_argument(
+        "--no-checkpoint",
+        action="store_true",
+        help="Disable checkpoint/resume support for this run.",
+    )
+    parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="Ignore compatible partial checkpoints and restart long-running stages.",
+    )
 
     # Slope-unit scientific parameters.
     parser.add_argument("--threshold-m2", type=float, default=250000.0)
@@ -137,6 +155,9 @@ def _run(args) -> None:
         workers=None if args.workers <= 0 else args.workers,
         numba_threads=None if args.numba_threads <= 0 else args.numba_threads,
         nodata_values=args.nodata,
+        checkpoint=not args.no_checkpoint,
+        checkpoint_minutes=args.checkpoint_minutes,
+        restart=args.restart,
         verbose=not args.quiet,
         **slopeunit_kwargs,
     )

@@ -4,44 +4,25 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .ruff_cache/
-build/
-dist/
+
+# Environments
 .venv/
 venv/
+env/
 
-# IDE
+# Build artifacts
+build/
+dist/
+
+# Editors / OS
+.DS_Store
 .idea/
 .vscode/
 
-# PySlopeUnits runtime / caches
-demodem/
+# PySlopeUnits runtime products
+workspace/
 work/
-output/
-cache/
-memmap/
-**/work/
-**/output/
-**/cache/
-**/memmap/
+run/
 *.npy
-*.npz
-*.dat
-*.tmp
-
-# Large geospatial data
-*.tif
-*.tiff
-*.vrt
-*.img
-*.asc
-*.las
-*.laz
-*.gpkg
-*.shp
-*.shx
-*.dbf
-*.prj
-
-# Benchmark output
-benchmarks/results/
-.DS_Store
+*.npy.tmp
+*.vrt.aux.xml

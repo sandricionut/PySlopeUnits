@@ -1278,6 +1278,128 @@ def init_mfd_valid_parallel(
 
 
 @njit(cache=True, parallel=True)
+def init_mfd_accum_state_spatial_parallel(
+    valid: np.ndarray,
+    accumulation: np.ndarray,
+    state: np.ndarray,
+):
+    """Initialize only the mutable MFD accumulation working set.
+
+    ``accumulation`` is the write-intensive product during reverse MFD
+    propagation.  Keeping receiver creation out of this phase reduces the
+    resident/file-backed working set and allows callers to place accumulation
+    in RAM when the resource budget permits it.  The scan is spatially
+    contiguous and numerically identical to the corresponding fields produced
+    by :func:`init_mfd_arrays_spatial_parallel`.
+    """
+    vf = valid.reshape(valid.size)
+    af = accumulation.reshape(accumulation.size)
+    sf = state.reshape(state.size)
+
+    n = af.size
+    for i in prange(n):
+        af[i] = 1.0 if vf[i] else 0.0
+        sf[i] = 0
+
+
+@njit(cache=True, parallel=True)
+def init_mfd_receiver_spatial_parallel(
+    valid: np.ndarray,
+    astar_receiver: np.ndarray,
+    adjusted_receiver: np.ndarray,
+):
+    """Initialize the persistent adjusted receiver immediately before use.
+
+    Deferring this array removes one large writable mapping from the
+    accumulation phase without changing any hydrological semantics.
+    """
+    vf = valid.reshape(valid.size)
+    rf = astar_receiver.reshape(astar_receiver.size)
+    df = adjusted_receiver.reshape(adjusted_receiver.size)
+
+    n = df.size
+    for i in prange(n):
+        df[i] = rf[i] if vf[i] else -1
+
+
+@njit(cache=True, parallel=True)
+def init_mfd_arrays_spatial_parallel(
+    valid: np.ndarray,
+    astar_receiver: np.ndarray,
+    accumulation: np.ndarray,
+    adjusted_receiver: np.ndarray,
+    state: np.ndarray,
+):
+    """Initialize MFD arrays with one spatially contiguous parallel scan.
+
+    Earlier implementations initialized all raster cells and then revisited
+    valid cells in A* ``order``.  The second pass is hydrologically ordered,
+    not spatially ordered, and therefore causes hundreds of millions of
+    scattered writes on large file-backed arrays.  On memory-constrained
+    systems this can trigger severe page-cache churn and write amplification.
+
+    MFD initialization has no dependency on A* rank/order.  The validity mask
+    already identifies exactly the cells that must start with accumulation 1
+    and the A* receiver is indexed directly by raster cell.  We can therefore
+    initialize every output in a single contiguous raster-index pass:
+
+        valid cell:   accumulation=1, adjusted_receiver=astar_receiver
+        invalid cell: accumulation=0, adjusted_receiver=-1
+        all cells:    state=0
+
+    The loop is race-free, deterministic, and preserves the exact output of
+    ``init_mfd_valid_serial`` while converting random memmap writes into
+    sequential/block-contiguous reads and writes.
+    """
+    vf = valid.reshape(valid.size)
+    rf = astar_receiver.reshape(astar_receiver.size)
+    af = accumulation.reshape(accumulation.size)
+    df = adjusted_receiver.reshape(adjusted_receiver.size)
+    sf = state.reshape(state.size)
+
+    n = af.size
+    for i in prange(n):
+        if vf[i]:
+            af[i] = 1.0
+            df[i] = rf[i]
+        else:
+            af[i] = 0.0
+            df[i] = -1
+        sf[i] = 0
+
+
+@njit(cache=True, parallel=True)
+def init_mfd_arrays_parallel(
+    order: np.ndarray,
+    astar_receiver: np.ndarray,
+    accumulation: np.ndarray,
+    adjusted_receiver: np.ndarray,
+    state: np.ndarray,
+):
+    """Deprecated v0.1.5/v0.1.6 MFD initializer retained for compatibility.
+
+    New engine code must use :func:`init_mfd_arrays_spatial_parallel` because
+    this historical implementation revisits valid cells in hydrological A*
+    order and can cause severe scattered-write amplification on large memmaps.
+    """
+    rf = astar_receiver.reshape(astar_receiver.size)
+    af = accumulation.reshape(accumulation.size)
+    df = adjusted_receiver.reshape(adjusted_receiver.size)
+    sf = state.reshape(state.size)
+
+    n = af.size
+    for i in prange(n):
+        af[i] = 0.0
+        df[i] = -1
+        sf[i] = 0
+
+    for pos in prange(order.size):
+        i = int(order[pos])
+        af[i] = 1.0
+        df[i] = rf[i]
+
+
+@njit(cache=True, parallel=True)
 def mfd_weights_block_parallel(
     dem_scaled: np.ndarray,
     valid: np.ndarray,

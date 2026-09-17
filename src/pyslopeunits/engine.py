@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .logging_utils import log as print
+
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -118,7 +120,6 @@ def _manifest_matches_dataset(got: dict, expected: dict) -> bool:
         "dem", "size", "mtime_ns", "shape", "xres", "yres",
         "convergence", "hydro_scale", "nodata_values",
         "hydrology_io_version", "index_dtype", "routing_mode",
-        "hydrology_domain_raster", "hydrology_domain_raster_stat",
     ]
     return all(got.get(k) == expected.get(k) for k in keys)
 
@@ -271,10 +272,13 @@ def _astar_checkpoint_matches_routing(
         info = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return False
-    return (
-        info.get("routing_mode") == expected.get("routing_mode")
-        and info.get("hydrology_domain_raster") == expected.get("hydrology_domain_raster")
-    )
+    # A completed exact global A* routing is independent of how its queues
+    # were sharded into hydrological computational domains.  Domain identity
+    # matters only for an *in-stage* frontier checkpoint, validated inside
+    # fine_hydrology.py.  Once A* is complete, routing_mode + DEM identity are
+    # sufficient and a rewritten/repartitioned domain raster must not force an
+    # expensive A* recomputation.
+    return info.get("routing_mode") == expected.get("routing_mode")
 
 def _array_shape_ok(store: MemmapStore, name: str, shape) -> bool:
     if not store.exists(name):
@@ -511,6 +515,9 @@ class SlopeUnits:
         memory_budget_bytes: int | None = None,
         scratch_ram_fraction: float = 0.50,
         hydrology_domain_raster: str | Path | None = None,
+        checkpoint: bool = True,
+        checkpoint_minutes: float = 15.0,
+        restart: bool = False,
         verbose: bool = True,
     ):
         if threshold_m2 <= 0:
@@ -550,6 +557,11 @@ class SlopeUnits:
         self.hydrology_domain_raster = (
             None if hydrology_domain_raster is None else Path(hydrology_domain_raster)
         )
+        self.checkpoint = bool(checkpoint)
+        self.checkpoint_minutes = float(checkpoint_minutes)
+        if self.checkpoint_minutes <= 0:
+            raise ValueError("checkpoint_minutes must be > 0")
+        self.restart = bool(restart)
         self.verbose = bool(verbose)
 
     def _prepare_hydrology(self, dem_path: Path, store: MemmapStore, meta: RasterMeta):
@@ -558,13 +570,14 @@ class SlopeUnits:
             self.nodata_values, self.hydrology_domain_raster,
         )
 
-        if self.reuse_hydrology and _hydrology_cache_ok(store, manifest):
+        if self.reuse_hydrology and not self.restart and _hydrology_cache_ok(store, manifest):
             if self.verbose:
                 print("[PySlopeUnits] reusing optimized memory-mapped hydrology cache")
             return
 
         if (
             self.reuse_hydrology
+            and not self.restart
             and _recover_completed_hydrology_cleanup_failure(
                 store,
                 dem_path,
@@ -581,6 +594,7 @@ class SlopeUnits:
         # expensive core arrays and hydro_dem are already available.
         if (
             self.reuse_hydrology
+            and not self.restart
             and _hydrology_core_ok(store, manifest)
             and store.exists("hydro_dem")
         ):
@@ -631,10 +645,31 @@ class SlopeUnits:
 
         resumed_astar = (
             self.resume_partial_hydrology
+            and not self.restart
             and _partial_astar_cache_ok(store, meta)
             and _astar_checkpoint_matches_routing(store, manifest)
         )
         edgeflag = None
+
+        # Mid-stage v0.1.6 A* checkpoint.  Unlike the completed routing cache
+        # above, this preserves the mutable frontier and can resume from inside
+        # the long exact domain-sharded A* traversal.
+        fine_astar_checkpoint = store.root.parent / "checkpoints" / "fine_astar.json"
+        partial_domain_astar = (
+            self.checkpoint
+            and not self.restart
+            and self.hydrology_domain_raster is not None
+            and fine_astar_checkpoint.exists()
+            and all(
+                store.exists(name)
+                for name in (
+                    "valid", "hydro_dem", "astar_receiver", "edgeflag", "order",
+                    "astar_domain_state", "astar_domain_heap_idx",
+                    "astar_domain_heap_age", "astar_domain_sizes",
+                    "astar_global_heap", "astar_global_pos",
+                )
+            )
+        )
 
         if resumed_astar:
             if self.verbose:
@@ -649,44 +684,49 @@ class SlopeUnits:
             nvalid = int(order.size)
 
         else:
-            shape = meta.shape
-            if self.verbose:
-                print(
-                    "[PySlopeUnits] preparing DEM out-of-core "
-                    "(blockwise raster -> memmap)"
+            if partial_domain_astar:
+                if self.verbose:
+                    print("[PySlopeUnits] detected resumable in-stage fine A* checkpoint")
+                valid = store.open("valid", "r")
+                hydro_dem = store.open("hydro_dem", "r")
+                astar_receiver = store.open("astar_receiver", "r+")
+                edgeflag = store.open("edgeflag", "r+")
+                order = store.open("order", "r+")
+                nvalid = int(order.size)
+                index_dtype = order.dtype
+            else:
+                if self.verbose:
+                    print(
+                        "[PySlopeUnits] preparing DEM blockwise | storage=memmap"
+                    )
+                nvalid = prepare_dem_memmaps_blockwise(
+                    dem_path,
+                    store,
+                    meta,
+                    nodata_values=self.nodata_values,
+                    hydro_scale=self.hydro_scale,
+                    numba_threads=self.numba_threads,
+                    max_block_cells=max(250_000, min(2_000_000, self.mfd_block_cells * 2)),
+                    verbose=self.verbose,
                 )
-            nvalid = prepare_dem_memmaps_blockwise(
-                dem_path,
-                store,
-                meta,
-                nodata_values=self.nodata_values,
-                hydro_scale=self.hydro_scale,
-                numba_threads=self.numba_threads,
-                max_block_cells=max(250_000, min(2_000_000, self.mfd_block_cells * 2)),
-                verbose=self.verbose,
-            )
-            valid = store.open("valid", "r")
-            hydro_dem = store.open("hydro_dem", "r")
+                valid = store.open("valid", "r")
+                hydro_dem = store.open("hydro_dem", "r")
 
-            index_dtype = index_dtype_for_shape(shape)
-            if self.verbose:
-                print(
-                    f"[PySlopeUnits] index dtype | {dtype_name(index_dtype)} | "
-                    f"grid-cells={int(shape[0]) * int(shape[1]):,}"
+                index_dtype = index_dtype_for_shape(shape)
+                if self.verbose:
+                    print(
+                        f"[PySlopeUnits] index dtype | {dtype_name(index_dtype)} | "
+                        f"grid-cells={int(shape[0]) * int(shape[1]):,}"
+                    )
+                astar_receiver = store.create(
+                    "astar_receiver", shape, index_dtype, fill=-1
                 )
-            astar_receiver = store.create(
-                "astar_receiver", shape, index_dtype, fill=-1
-            )
-            edgeflag = store.create(
-                "edgeflag", shape, np.uint8, fill=0
-            )
-            order = store.create("order", (nvalid,), index_dtype)
+                edgeflag = store.create(
+                    "edgeflag", shape, np.uint8, fill=0
+                )
+                order = store.create("order", (nvalid,), index_dtype)
 
             if self.hydrology_domain_raster is not None:
-                # V10: exact global A* semantics with the priority queue sharded
-                # by coarse hydrological processing domains. Domains are queue
-                # and storage shards only; global arbitration preserves the exact
-                # cross-domain processing order.
                 astar_result = run_domain_sharded_astar(
                     store,
                     meta=meta,
@@ -700,6 +740,9 @@ class SlopeUnits:
                     xres_scaled=meta.xres * self.hydro_scale,
                     yres_scaled=meta.yres * self.hydro_scale,
                     index_dtype=index_dtype,
+                    checkpoint=self.checkpoint,
+                    checkpoint_minutes=self.checkpoint_minutes,
+                    restart=self.restart,
                     verbose=self.verbose,
                 )
                 visited = int(astar_result.visited_cells)
@@ -755,8 +798,8 @@ class SlopeUnits:
             order.flush()
             edgeflag.flush()
 
-            # Explicit routing checkpoint. If the process is stopped during
-            # MFD, the next run resumes here instead of repeating A*.
+            # Completed-stage checkpoint.  If the process is stopped during
+            # MFD or any later stage, A* is never repeated.
             store.write_json(
                 "astar_checkpoint.json",
                 {
@@ -769,9 +812,18 @@ class SlopeUnits:
                 },
             )
 
+            # The compact completion checkpoint above now owns restartability.
+            # Remove the large in-stage frontier arrays only after it is durable.
+            for _name in (
+                "astar_domain_state", "astar_domain_heap_idx",
+                "astar_domain_heap_age", "astar_domain_sizes",
+                "astar_global_heap", "astar_global_pos",
+            ):
+                store.remove(_name, best_effort=True)
+
         mfd_ready = False
 
-        if _mfd_checkpoint_ok(store, meta, self.convergence):
+        if not self.restart and _mfd_checkpoint_ok(store, meta, self.convergence):
             mfd_ready = True
             if self.verbose:
                 print(
@@ -779,7 +831,7 @@ class SlopeUnits:
                     "(no MFD recomputation)"
                 )
 
-        elif _recover_stage11_windows_cleanup_failure(store, meta):
+        elif not self.restart and _recover_stage11_windows_cleanup_failure(store, meta):
             # This is exactly the state produced by the Stage-11 WinError 32
             # reported after adjusted-receiver completion.
             mfd_ready = True
@@ -897,7 +949,7 @@ class SlopeUnits:
         dem_path = Path(dem_path)
         output_path = Path(output_path)
         if work_dir is None:
-            work_dir = output_path.parent / f"{output_path.stem}_work"
+            work_dir = output_path.parent / "workspace" / "engine"
         work_dir = Path(work_dir)
         work_dir.mkdir(parents=True, exist_ok=True)
         store = MemmapStore(

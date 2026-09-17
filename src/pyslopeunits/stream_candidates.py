@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .logging_utils import log as print
+
 """On-demand candidate generation for bounded-disk lazy hierarchy runs."""
 
 from concurrent.futures import ProcessPoolExecutor
