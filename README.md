@@ -265,16 +265,6 @@ Vector export and diagnostic products can be disabled for large benchmark runs:
 pyslopeunits dem.tif run --no-vector --no-diagnostics
 ```
 
-## Tests
-
-The test suite should remain part of the repository. Run it before committing a release:
-
-```bash
-python -m pytest -q
-```
-
-The release overlay also includes a small `test_release_v018.py` smoke test; it is intended to complement, not replace, the existing project tests.
-
 ## License
 
 PySlopeUnits is free and open-source software distributed under the
