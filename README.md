@@ -63,7 +63,7 @@ Linux, macOS and Windows are supported.
 Clone the repository and install in editable mode:
 
 ```bash
-git clone https://github.com/sandricionut/PySlopeUnits.git>
+git clone https://github.com/sandricionut/PySlopeUnits.git
 cd PySlopeUnits
 python -m pip install -e .
 ```
@@ -274,6 +274,13 @@ python -m pytest -q
 ```
 
 The release overlay also includes a small `test_release_v018.py` smoke test; it is intended to complement, not replace, the existing project tests.
+
+## License
+
+PySlopeUnits is free and open-source software distributed under the
+GNU General Public License v3.0 (GPL-3.0).
+See the [LICENSE](LICENSE) file for details.
+
 
 ## Reproducibility
 
