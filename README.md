@@ -4,7 +4,7 @@
 
 PySlopeUnits is an open-source Python package for delineating geomorphological slope units from digital elevation models (DEMs). It is designed to use the same scientific parameterization from local or regional DEMs to grids containing hundreds of millions of cells, while adapting memory use and intermediate storage to the available hardware.
 
-Version **0.1.8** is the software release used for the benchmark experiments associated with the *Environmental Modelling & Software* manuscript.
+Version **0.1.8** is the software release used for the benchmark experiments associated with the *Computers & Geosciences* manuscript.
 
 ## Main features
 
@@ -63,7 +63,7 @@ Linux, macOS and Windows are supported.
 Clone the repository and install in editable mode:
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/sandricionut/PySlopeUnits.git>
 cd PySlopeUnits
 python -m pip install -e .
 ```
